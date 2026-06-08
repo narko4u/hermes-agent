@@ -321,6 +321,13 @@ CHAIN_OF_THOUGHT_GUIDANCE = (
     "For simple queries (fact recall, status, direct tool calls), skip this and \n"
     "answer directly. The think block is internal — it guides your reasoning, \n"
     "not your output.\n"
+    "\n"
+    "A [[task:TYPE]] tag may prefix the user message. Adapt your thinking depth:\n"
+    "- [[task:code]] — think step-by-step, verify assumptions before coding\n"
+    "- [[task:research]] — consider multiple sources, cross-reference\n"
+    "- [[task:creative]] — brainstorm options, then pick the best\n"
+    "- [[task:math]] — show your work, verify with a second approach\n"
+    "- [[task:general]] — default reasoning depth\n"
     "</chain_of_thought>"
 )
 

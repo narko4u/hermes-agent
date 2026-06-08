@@ -576,11 +576,44 @@ def run_conversation(
             _should_review_memory = True
             agent._turns_since_memory = 0
 
+    # ── Dynamic iteration budget ──
+    # Simple heuristic: short queries need fewer iterations; code/research
+    # queries need more.  Adjusts agent.max_iterations per-turn.
+    _raw_msg = user_message or ""
+    _len = len(_raw_msg)
+    _has_code = any(kw in _raw_msg for kw in ["code", "function", "class ", "def ", "build", "test", "implement"])
+    _has_research = any(kw in _raw_msg for kw in ["search", "find", "research", "investigate", "why", "how does"])
+    if _len < 50 and not _has_code and not _has_research:
+        _dynamic_budget = 5   # quick: simple lookup, single tool call
+    elif _has_code or _has_research or _len > 200:
+        _dynamic_budget = 90  # deep: multi-step code/research task
+    else:
+        _dynamic_budget = 20  # standard: moderate complexity
+    agent.iteration_budget = IterationBudget(_dynamic_budget)
+
     # Add user message
     user_msg = {"role": "user", "content": user_message}
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
+
+    # ── Task-type hint — prepended to user message ──
+    # Tags the turn with the task category so the model adapts behaviour
+    # without changing provider or injecting a separate system message.
+    _task_keywords = {
+        "code": ["code", "function", "class ", "def ", "build", "test", "implement", "bug", "debug", "fix", "refactor", "algorithm"],
+        "research": ["search", "find", "research", "investigate", "what is", "how does", "explain", "analyze", "compare", "why does"],
+        "creative": ["write", "create", "design", "compose", "generate", "brainstorm", "idea", "story", "poem", "name"],
+        "math": ["calculate", "compute", "solve", "equation", "formula", "sum", "total", "average", "statistics", "probability"],
+    }
+    _msg_lower = user_message.lower()
+    _task_type = "general"
+    for ttype, kws in _task_keywords.items():
+        if any(kw in _msg_lower for kw in kws):
+            _task_type = ttype
+            break
+    # Prepend task tag to user message
+    user_msg["content"] = f"[[task:{_task_type}]]\n{user_message}"
     
     if not agent.quiet_mode:
         _print_preview = _summarize_user_message_for_log(user_message)
