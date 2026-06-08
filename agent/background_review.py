@@ -234,6 +234,35 @@ _COMBINED_REVIEW_PROMPT = (
 
 
 
+# Correction-capture prompt — Sovereign's first-priority self-improvement signal.
+# Runs on EVERY turn, not just nudged turns. Catches Eddie's corrections immediately.
+_CORRECTION_CAPTURE_PROMPT = (
+    "You are Sovereign's correction-capture system. Your ONLY job: scan the "
+    "conversation above for signs that the user (Eddie) corrected you.\n\n"
+    "A correction is any signal that you did something wrong, suboptimal, or "
+    "against preference. Look for:\n"
+    "  - Explicit: 'stop doing X', \"don't\", 'I hate when you', 'no', 'wrong', "
+    "'not what I meant', 'that's not', 'I told you', 'remember', 'you keep'\n"
+    "  - Implicit: user rephrased the same request, user had to clarify, user "
+    "sounded frustrated, user said 'try again' or 'different approach'\n"
+    "  - Style/tone: user corrected how you formatted, how much you wrote, "
+    "your level of detail, your output structure\n"
+    "  - Workflow: user corrected your sequence of steps, tool choices, or "
+    "approach to a problem\n"
+    "  - Technical: user corrected a fact, a command, a configuration, or a "
+    "technical assumption you made\n\n"
+    "If you found a correction:\n"
+    "  1. Identify the skill or mental model that governs this class of task\n"
+    "  2. Update it so the correction is embedded as a pitfall, a rule, or "
+    "a preference note\n"
+    "  3. Use the memory tool to save the user-preference fact too\n"
+    "  4. If no existing skill covers this class, propose a new one\n\n"
+    "If you found NO correction, say 'Nothing to save.' and stop. Be honest.\n"
+    "Missing a correction is worse than over-saving - a missed correction "
+    "means Eddie has to repeat himself."
+)
+
+
 def summarize_background_review_actions(
     review_messages: List[Dict],
     prior_snapshot: List[Dict],
@@ -564,17 +593,18 @@ def spawn_background_review_thread(
     messages_snapshot: List[Dict],
     review_memory: bool = False,
     review_skills: bool = False,
+    review_corrections: bool = False,
 ):
     """Build the review thread target and prompt for a background review.
 
-    Returns a ``(target, prompt)`` tuple.  The caller (``AIAgent._spawn_background_review``)
-    owns the actual ``threading.Thread`` construction so test-level patches
-    of ``run_agent.threading.Thread`` keep working.
+    ``review_corrections`` ALWAYS uses the correction-capture prompt and
+    overrides ``review_memory``/``review_skills`` when True — catching
+    corrections is the highest-priority self-improvement signal.
     """
-    # Pick the right prompt based on which triggers fired.  Allow per-agent
-    # override (the prompts moved to module-level constants but old code paths
-    # that set agent._MEMORY_REVIEW_PROMPT etc. directly keep working).
-    if review_memory and review_skills:
+    # Correction prompts come first — highest priority signal.
+    if review_corrections:
+        prompt = getattr(agent, "_CORRECTION_CAPTURE_PROMPT", _CORRECTION_CAPTURE_PROMPT)
+    elif review_memory and review_skills:
         prompt = getattr(agent, "_COMBINED_REVIEW_PROMPT", _COMBINED_REVIEW_PROMPT)
     elif review_memory:
         prompt = getattr(agent, "_MEMORY_REVIEW_PROMPT", _MEMORY_REVIEW_PROMPT)
@@ -591,6 +621,7 @@ __all__ = [
     "_MEMORY_REVIEW_PROMPT",
     "_SKILL_REVIEW_PROMPT",
     "_COMBINED_REVIEW_PROMPT",
+    "_CORRECTION_CAPTURE_PROMPT",
     "spawn_background_review_thread",
     "summarize_background_review_actions",
     "build_memory_write_metadata",

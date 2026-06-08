@@ -566,6 +566,8 @@ def run_conversation(
     # Skill trigger is checked AFTER the agent loop completes, based on
     # how many tool iterations THIS turn used.
     _should_review_memory = False
+    # Correction detection runs EVERY turn — highest priority signal
+    _should_review_corrections = True
     if (agent._memory_nudge_interval > 0
             and "memory" in agent.valid_tool_names
             and agent._memory_store):
@@ -4923,12 +4925,14 @@ def run_conversation(
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    # Correction capture runs EVERY turn — catches Eddie's corrections immediately.
+    if final_response and not interrupted and (_should_review_corrections or _should_review_memory or _should_review_skills):
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
                 review_memory=_should_review_memory,
                 review_skills=_should_review_skills,
+                review_corrections=_should_review_corrections,
             )
         except Exception:
             pass  # Background review is best-effort

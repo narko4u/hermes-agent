@@ -1406,14 +1406,12 @@ class AIAgent:
         messages_snapshot: List[Dict],
         review_memory: bool = False,
         review_skills: bool = False,
+        review_corrections: bool = False,
     ) -> None:
         """Spawn the background memory/skill review thread.
 
-        Thin wrapper — the heavy lifting lives in
-        ``agent.background_review.spawn_background_review_thread`` which
-        returns the thread target.  ``threading.Thread`` is constructed
-        here so existing tests that patch ``run_agent.threading.Thread``
-        keep working.
+        ``review_corrections`` is the highest-priority review — runs on
+        every turn to catch Eddie's corrections immediately.
         """
         from agent.background_review import spawn_background_review_thread
         target, _prompt = spawn_background_review_thread(
@@ -1421,6 +1419,7 @@ class AIAgent:
             messages_snapshot,
             review_memory=review_memory,
             review_skills=review_skills,
+            review_corrections=review_corrections,
         )
         t = threading.Thread(target=target, daemon=True, name="bg-review")
         t.start()
