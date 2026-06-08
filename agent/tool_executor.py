@@ -490,38 +490,63 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # submit site below (GHSA-qg5c-hvr5-hjgr, #13617).
         start = time.time()
         try:
-            try:
-                result = agent._invoke_tool(
-                    function_name,
-                    function_args,
-                    effective_task_id,
-                    tool_call.id,
-                    messages=messages,
-                    pre_tool_block_checked=True,
-                    skip_tool_request_middleware=True,
-                    tool_request_middleware_trace=list(middleware_trace),
-                )
-            except KeyboardInterrupt:
+            # ── Retry loop for transient tool failures ─────────────
+            # Retries on rate limits, timeouts, and 5xx server errors.
+            # Backoff: 1s, 2s, 4s. Max 3 attempts.
+            _last_error = None
+            for attempt in range(3):
                 try:
-                    agent.interrupt("keyboard interrupt")
-                except Exception:
-                    pass
-                result = _emit_cancelled_terminal_post_tool_call(
-                    agent,
-                    function_name=function_name,
-                    function_args=function_args,
-                    effective_task_id=effective_task_id,
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    start_time=start,
-                    middleware_trace=list(middleware_trace),
-                )
-                duration = time.time() - start
-                logger.info("tool %s cancelled (%.2fs)", function_name, duration)
-                results[index] = (function_name, function_args, result, duration, True, False, middleware_trace)
-                return
-            except Exception as tool_error:
-                result = f"Error executing tool '{function_name}': {tool_error}"
-                logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+                    result = agent._invoke_tool(
+                        function_name,
+                        function_args,
+                        effective_task_id,
+                        tool_call.id,
+                        messages=messages,
+                        pre_tool_block_checked=True,
+                        skip_tool_request_middleware=True,
+                        tool_request_middleware_trace=list(middleware_trace),
+                    )
+                    _last_error = None
+                    break
+                except KeyboardInterrupt:
+                    try:
+                        agent.interrupt("keyboard interrupt")
+                    except Exception:
+                        pass
+                    result = _emit_cancelled_terminal_post_tool_call(
+                        agent,
+                        function_name=function_name,
+                        function_args=function_args,
+                        effective_task_id=effective_task_id,
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        start_time=start,
+                        middleware_trace=list(middleware_trace),
+                    )
+                    duration = time.time() - start
+                    logger.info("tool %s cancelled (%.2fs)", function_name, duration)
+                    results[index] = (function_name, function_args, result, duration, True, False, middleware_trace)
+                    return
+                except Exception as tool_error:
+                    _error_str = str(tool_error).lower()
+                    # Transient: rate limit, timeout, 429, 503, 502
+                    _is_transient = any(
+                        kw in _error_str
+                        for kw in ["rate limit", "rate_limit", "timeout", "429", "503", "502", "too many requests", "temporarily unavailable", "try again"]
+                    )
+                    if _is_transient and attempt < 2:
+                        _sleep = 2 ** attempt  # 1s, 2s, 4s
+                        logger.warning(
+                            "tool %s transient error (attempt %d/3): %s — retrying in %ds",
+                            function_name, attempt + 1, tool_error, _sleep,
+                        )
+                        time.sleep(_sleep)
+                        _last_error = tool_error
+                        continue
+                    _last_error = tool_error
+                    break
+            if _last_error is not None:
+                result = f"Error executing tool '{function_name}': {_last_error}"
+                logger.error("_invoke_tool raised for %s: %s", function_name, _last_error, exc_info=True)
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
             if is_error:

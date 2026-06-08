@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -62,11 +63,17 @@ MUTATING_TOOL_NAMES = frozenset(
 
 @dataclass(frozen=True)
 class ToolCallGuardrailConfig:
-    """Thresholds for per-turn tool-call loop detection.
+    """Thresholds for per-turn tool-call loop detection and destructive-action
+    pre-checks.
 
     Warnings are enabled by default and never prevent tool execution. Hard stops
     are explicit opt-in so interactive CLI/TUI sessions get a gentle nudge unless
     the user enables circuit-breaker behavior in config.yaml.
+
+    Patch 10 adds destructive_action_guard: when enabled, high-risk tools
+    (write_file to config paths, destructive terminal commands, git push --force,
+    write to .env/secrets paths) are blocked with a message directing the user
+    to confirm.  Soft mode (default) logs a warning; hard mode blocks.
     """
 
     warnings_enabled: bool = True
@@ -79,6 +86,8 @@ class ToolCallGuardrailConfig:
     no_progress_block_after: int = 5
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
+    destructive_action_guard: str = "soft"  # "off" | "soft" | "hard"
+
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "ToolCallGuardrailConfig":
@@ -121,6 +130,7 @@ class ToolCallGuardrailConfig:
                 hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
                 defaults.no_progress_block_after,
             ),
+            destructive_action_guard=data.get("destructive_action_guard", defaults.destructive_action_guard),
         )
 
 
@@ -240,6 +250,26 @@ class ToolCallGuardrailController:
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+
+        # ── Destructive action pre-check (Patch 10) ──────────────
+        # Runs before the hard-stop/repetition checks so dangerous
+        # commands are caught on the first attempt.
+        if self.config.destructive_action_guard != "off":
+            _destructive_msg = _check_destructive_action(tool_name, _coerce_args(args))
+            if _destructive_msg is not None:
+                action = "block" if self.config.destructive_action_guard == "hard" else "allow"
+                decision = ToolGuardrailDecision(
+                    action=action,
+                    code="destructive_action_guard",
+                    message=_destructive_msg,
+                    tool_name=tool_name,
+                    count=0,
+                    signature=signature,
+                )
+                if action == "block":
+                    self._halt_decision = decision
+                return decision
+
         if not self.config.hard_stop_enabled:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -443,6 +473,78 @@ def _result_hash(result: str | None) -> str:
     else:
         canonical = result or ""
     return _sha256(canonical)
+
+
+# ── Destructive action pre-checks (Patch 10) ─────────────────────
+# Regex for detecting dangerous terminal commands
+_DESTRUCTIVE_TERMINAL_PATTERN = re.compile(
+    r"(?:^|\s|&&|\|\||;)(?:\brm\s+(?:-[rf]+\s+)?/|rm\s+-rf\b)",
+    re.IGNORECASE,
+)
+
+# Path patterns that should never be overwritten without approval
+_PROTECTED_PATH_PATTERNS = [
+    re.compile(r"/\.env(\b|$)"),
+    re.compile(r"/config\.ya?ml(\b|$)"),
+    re.compile(r"/secrets/"),
+    re.compile(r"/\.hermes/"),
+    re.compile(r"/credentials"),
+    re.compile(r"/tokens"),
+    re.compile(r"/keys/"),
+]
+
+# Tools that are always reviewed for destructive potential
+_DESTRUCTIVE_TOOLS = frozenset({
+    "write_file",
+    "patch",
+    "terminal",
+})
+
+
+def _is_protected_path(path: str) -> bool:
+    """Check whether a file path matches protected patterns."""
+    if not path:
+        return False
+    return any(p.search(path) for p in _PROTECTED_PATH_PATTERNS)
+
+
+def _is_destructive_terminal_cmd(cmd: str) -> bool:
+    """Check if a terminal command is destructive."""
+    if not cmd:
+        return False
+    if _DESTRUCTIVE_TERMINAL_PATTERN.search(cmd):
+        return True
+    cmd_lower = cmd.lower()
+    if "git push --force" in cmd_lower or "git push -f" in cmd_lower:
+        return True
+    if "rm -rf" in cmd_lower and "~" in cmd_lower:
+        return True
+    return False
+
+
+def _check_destructive_action(
+    tool_name: str, args: Mapping[str, Any]
+) -> str | None:
+    """Return a block message if this tool call is dangerous, or None."""
+    if tool_name not in _DESTRUCTIVE_TOOLS:
+        return None
+    if tool_name == "terminal":
+        cmd = args.get("command", "")
+        if _is_destructive_terminal_cmd(cmd):
+            return (
+                f"Blocked destructive terminal command: '{cmd[:80]}'. "
+                "This command could delete or overwrite system files. "
+                "If you intend to run this, please approve it explicitly."
+            )
+    elif tool_name in ("write_file", "patch"):
+        path = args.get("path", "")
+        if _is_protected_path(path):
+            return (
+                f"Blocked {tool_name} to protected path: '{path}'. "
+                "This file contains configuration or credentials. "
+                "If you intend to modify it, please approve explicitly."
+            )
+    return None
 
 
 def _as_bool(value: Any, default: bool) -> bool:
