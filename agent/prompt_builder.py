@@ -304,6 +304,26 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
+# Universal chain-of-thought guidance — injected for EVERY model.
+# Forces structured reasoning before acting on complex tasks.
+# Simple queries (fact recall, direct tool calls) skip this entirely.
+CHAIN_OF_THOUGHT_GUIDANCE = (
+    "<chain_of_thought>\n"
+    "For complex tasks — multi-step reasoning, code, architecture, planning, \n"
+    "debugging, or anything with trade-offs — you must structure your thinking \n"
+    "before acting. Think inside <think> tags before your response. Your thought \n"
+    "process should cover:\n"
+    "- What is being asked (restate the core problem)\n"
+    "- What approaches exist (evaluate 2-3 options)\n"
+    "- Which approach is best and why\n"
+    "- What could go wrong and how to mitigate\n"
+    "- Step-by-step execution plan\n"
+    "For simple queries (fact recall, status, direct tool calls), skip this and \n"
+    "answer directly. The think block is internal — it guides your reasoning, \n"
+    "not your output.\n"
+    "</chain_of_thought>"
+)
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.
@@ -345,7 +365,7 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- 'What time is it?' → run `date` (don't guess)\n"
     "Only ask for clarification when the ambiguity genuinely changes what tool "
     "you would call.\n"
-    "</act_dont_ask>\n"
+    "</act_dont_ask>"
     "\n"
     "<prerequisite_checks>\n"
     "- Before taking an action, check whether prerequisite discovery, lookup, or "

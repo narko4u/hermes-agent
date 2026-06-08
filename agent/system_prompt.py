@@ -111,6 +111,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
         stable_parts.append(TASK_COMPLETION_GUIDANCE)
 
+    # Chain-of-thought guidance: forced structured reasoning for complex
+    # tasks. Universal — applies to every model that has tools.
+    from agent.prompt_builder import CHAIN_OF_THOUGHT_GUIDANCE
+    stable_parts.append(CHAIN_OF_THOUGHT_GUIDANCE)
+
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []
     if "memory" in agent.valid_tool_names:
