@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Memory Tool Module - Persistent Curated Memory
+Memory Tool Module - Persistent Curated Memory (Sovereign Tiered Edition)
 
 Provides bounded, file-backed memory that persists across sessions. Two stores:
   - MEMORY.md: agent's personal notes and observations (environment facts, project
@@ -8,24 +8,17 @@ Provides bounded, file-backed memory that persists across sessions. Two stores:
   - USER.md: what the agent knows about the user (preferences, communication style,
     expectations, workflow habits)
 
-Both are injected into the system prompt as a frozen snapshot at session start.
-Mid-session writes update files on disk immediately (durable) but do NOT change
-the system prompt -- this preserves the prefix cache for the entire session.
-The snapshot refreshes on the next session start.
-
-Entry delimiter: § (section sign). Entries can be multiline.
-Character limits (not tokens) because char counts are model-independent.
-
-Design:
-- Single `memory` tool with action parameter: add, replace, remove, read
-- replace/remove use short unique substring matching (not full text or IDs)
-- Behavioral guidance lives in the tool schema description
-- Frozen snapshot pattern: system prompt is stable, tool responses show live state
+TIERED STORAGE (Sovereign patch v1):
+  - HOT tier: MEMORY.md / USER.md (flat files, char-limited, in system prompt)
+  - WARM tier: Sovereign Vault (SQLite, unlimited, available on request)
+  When HOT tier reaches its char limit, oldest entries automatically overflow to
+  WARM tier. The system prompt shows both tiers' usage.
 """
 
 import json
 import logging
 import os
+import sys
 import tempfile
 import time
 from contextlib import contextmanager
@@ -48,10 +41,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Where memory files live — resolved dynamically so profile overrides
-# (HERMES_HOME env var changes) are always respected.  The old module-level
-# constant was cached at import time and could go stale if a profile switch
-# happened after the first import.
+
 def get_memory_dir() -> Path:
     """Return the profile-scoped memories directory."""
     return get_hermes_home() / "memories"
@@ -60,16 +50,113 @@ ENTRY_DELIMITER = "\n§\n"
 
 
 # ---------------------------------------------------------------------------
-# Memory content scanning — lightweight check for injection/exfiltration
-# in content that gets injected into the system prompt.
-#
-# Patterns live in ``tools/threat_patterns.py`` — the single source of truth
-# shared with the context-file scanner and the tool-result delimiter system.
-# Memory uses the "strict" scope (broadest pattern set) because:
-#  - memory entries are user-curated; the user can rewrite a flagged entry
-#  - memory enters the system prompt as a FROZEN snapshot, so a poisoned
-#    entry persists for the entire session and across sessions until
-#    explicitly removed.
+# Sovereign Vault warm-tier integration
+# ---------------------------------------------------------------------------
+
+_VAULT_IMPORTED = False
+_set_value = None
+_get_value = None
+_list_section = None
+_delete_key = None
+
+def _import_vault():
+    """Lazy-import the Sovereign Vault module. Fails silently if not available."""
+    global _VAULT_IMPORTED, _set_value, _get_value, _list_section, _delete_key
+    if _VAULT_IMPORTED:
+        return True
+    try:
+        vault_path = "/mnt/c/VaultSentinel/Sovereign"
+        vault_file = os.path.join(vault_path, "sovereign_vault.py")
+        if os.path.isfile(vault_file):
+            if vault_path not in sys.path:
+                sys.path.insert(0, vault_path)
+            import sovereign_vault
+            _set_value = sovereign_vault.set_value
+            _get_value = sovereign_vault.get_value
+            _list_section = sovereign_vault.list_section
+            _delete_key = sovereign_vault.delete_key
+            _VAULT_IMPORTED = True
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _warm_count(target: str) -> int:
+    """Return number of warm-tier entries for a target (memory or user)."""
+    if not _import_vault():
+        return 0
+    try:
+        prefix = f"memory_warm_" if target == "memory" else f"user_warm_"
+        results = _list_section(target)
+        if isinstance(results, list):
+            return len([r for r in results if r.get("key", "").startswith(prefix)])
+    except Exception:
+        pass
+    return 0
+
+
+def _warm_entries_list(target: str) -> List[Dict[str, str]]:
+    """Return list of {key, value} dicts from the warm tier."""
+    if not _import_vault():
+        return []
+    try:
+        prefix = f"memory_warm_" if target == "memory" else f"user_warm_"
+        results = _list_section(target)
+        if isinstance(results, list):
+            entries = []
+            for r in results:
+                key = r.get("key", "")
+                if key.startswith(prefix):
+                    # Need to fetch full value — list_section only returns preview (100 chars)
+                    val = _get_value(target, key)
+                    entries.append({"key": key, "value": val if val else ""})
+            return entries
+    except Exception:
+        pass
+    return []
+
+
+def _warm_get(target: str, key: str) -> Optional[str]:
+    """Get a specific warm-tier entry by key suffix."""
+    if not _import_vault():
+        return None
+    try:
+        full_key = f"memory_warm_{key}" if target == "memory" else f"user_warm_{key}"
+        result = _get_value(target, full_key)
+        if result is not None:
+            return str(result)
+    except Exception:
+        pass
+    return None
+
+
+def _warm_set(target: str, key: str, content: str) -> bool:
+    """Store an entry in the warm tier."""
+    if not _import_vault():
+        return False
+    try:
+        full_key = f"memory_warm_{key}" if target == "memory" else f"user_warm_{key}"
+        _set_value(target, full_key, content, expires_in="90d")
+        return True
+    except Exception:
+        return False
+
+
+def _warm_remove(target: str, key: str) -> bool:
+    """Remove a warm-tier entry via raw SQLite."""
+    if not _import_vault():
+        return False
+    try:
+        full_key = f"memory_warm_{key}" if target == "memory" else f"user_warm_{key}"
+        _delete_key(target, full_key)
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Threat scanning (unchanged from upstream)
 # ---------------------------------------------------------------------------
 
 from tools.threat_patterns import first_threat_message as _first_threat_message
@@ -81,14 +168,7 @@ def _scan_memory_content(content: str) -> Optional[str]:
 
 
 def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
-    """Build the error dict returned when external drift is detected.
-
-    The on-disk memory file contains content that wouldn't round-trip
-    through the tool's parser/serializer — flushing would discard the
-    appended/edited content from a patch tool, shell append, manual edit,
-    or sister-session write. We refuse the mutation, point the operator at
-    the .bak.<ts> snapshot we took, and tell them what to do next.
-    """
+    """Build the error dict returned when external drift is detected."""
     return {
         "success": False,
         "error": (
@@ -112,13 +192,14 @@ def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
 
 class MemoryStore:
     """
-    Bounded curated memory with file persistence. One instance per AIAgent.
+    Bounded curated memory with file persistence and Sovereign warm-tier overflow.
 
-    Maintains two parallel states:
-      - _system_prompt_snapshot: frozen at load time, used for system prompt injection.
-        Never mutated mid-session. Keeps prefix cache stable.
-      - memory_entries / user_entries: live state, mutated by tool calls, persisted to disk.
-        Tool responses always reflect this live state.
+    Two tiers:
+      - HOT: MEMORY.md / USER.md flat files (char-limited, in system prompt)
+      - WARM: Sovereign Vault SQLite (unlimited, available on request via read_warm)
+
+    When HOT tier reaches char_limit, oldest entries automatically overflow to
+    WARM tier. The system prompt header shows both tiers' status.
     """
 
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
@@ -130,23 +211,7 @@ class MemoryStore:
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
 
     def load_from_disk(self):
-        """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
-
-        The frozen snapshot is what enters the system prompt. We scan each
-        entry for injection/promptware patterns at snapshot-build time —
-        ANY hit replaces the entry text in the snapshot with a placeholder
-        like ``[BLOCKED: …]``, so a poisoned-on-disk memory file (supply
-        chain, compromised tool, sister-session write) cannot inject into
-        the system prompt.
-
-        The live ``memory_entries`` / ``user_entries`` lists keep the
-        original text so the user can still SEE poisoned entries via
-        ``memory(action=read)`` and remove them — silently dropping them
-        would hide the attack from the user.
-
-        Scanning is deterministic from disk bytes, so the snapshot remains
-        stable for the entire session (prefix-cache invariant holds).
-        """
+        """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
@@ -157,9 +222,7 @@ class MemoryStore:
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
 
-        # Sanitize entries for the system-prompt snapshot only.  Live state
-        # (memory_entries / user_entries) keeps the raw text so the user
-        # can see + remove poisoned entries via the memory tool.
+        # Sanitize entries for the system-prompt snapshot only.
         sanitized_memory = self._sanitize_entries_for_snapshot(self.memory_entries, "MEMORY.md")
         sanitized_user = self._sanitize_entries_for_snapshot(self.user_entries, "USER.md")
 
@@ -171,17 +234,7 @@ class MemoryStore:
 
     @staticmethod
     def _sanitize_entries_for_snapshot(entries: List[str], filename: str) -> List[str]:
-        """Return ``entries`` with any threat-matching entry replaced by a placeholder.
-
-        Each entry is scanned with the shared threat-pattern library at the
-        ``"strict"`` scope (same as memory writes).  On match, the entry is
-        replaced in the returned list with ``"[BLOCKED: <filename> entry
-        contained threat pattern: <ids>. Removed from system prompt.]"`` —
-        the placeholder enters the snapshot, the original entry stays in
-        live state for the user to inspect and delete.
-
-        Empty or already-block-marker entries pass through unchanged.
-        """
+        """Return ``entries`` with any threat-matching entry replaced by a placeholder."""
         from tools.threat_patterns import scan_for_threats
 
         sanitized: List[str] = []
@@ -208,11 +261,7 @@ class MemoryStore:
     @staticmethod
     @contextmanager
     def _file_lock(path: Path):
-        """Acquire an exclusive file lock for read-modify-write safety.
-
-        Uses a separate .lock file so the memory file itself can still be
-        atomically replaced via os.replace().
-        """
+        """Acquire an exclusive file lock for read-modify-write safety."""
         lock_path = path.with_suffix(path.suffix + ".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -250,16 +299,7 @@ class MemoryStore:
         return mem_dir / "MEMORY.md"
 
     def _reload_target(self, target: str) -> Optional[str]:
-        """Re-read entries from disk into in-memory state.
-
-        Called under file lock to get the latest state before mutating.
-        Returns the backup path if external drift was detected (the on-disk
-        file contains content that wouldn't round-trip through our
-        parser/serializer, OR an entry larger than the store's char limit).
-        When drift is detected the caller must abort the mutation —
-        flushing would discard the un-roundtrippable content.
-        Returns None on clean reload.
-        """
+        """Re-read entries from disk into in-memory state."""
         path = self._path_for(target)
         bak = self._detect_external_drift(target)
         fresh = self._read_file(path)
@@ -295,7 +335,7 @@ class MemoryStore:
         return self.memory_char_limit
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
-        """Append a new entry. Returns error if it would exceed the char limit."""
+        """Append a new entry. Overflow to warm tier if hot tier is full."""
         content = content.strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
@@ -306,10 +346,6 @@ class MemoryStore:
             return {"success": False, "error": scan_error}
 
         with self._file_lock(self._path_for(target)):
-            # Re-read from disk under lock to pick up writes from other sessions.
-            # If external drift was detected, the file was backed up to .bak.<ts>
-            # — refuse the mutation so we don't clobber the un-roundtrippable
-            # content the patch tool / shell append / sister session wrote.
             bak = self._reload_target(target)
             if bak:
                 return _drift_error(self._path_for(target), bak)
@@ -326,17 +362,39 @@ class MemoryStore:
             new_total = len(ENTRY_DELIMITER.join(new_entries))
 
             if new_total > limit:
-                current = self._char_count(target)
-                return {
-                    "success": False,
-                    "error": (
-                        f"Memory at {current:,}/{limit:,} chars. "
-                        f"Adding this entry ({len(content)} chars) would exceed the limit. "
-                        f"Replace or remove existing entries first."
-                    ),
-                    "current_entries": entries,
-                    "usage": f"{current:,}/{limit:,}",
-                }
+                # --- Sovereign tiered overflow ---
+                # Move oldest entries to warm tier until the new entry fits
+                overflow_count = 0
+                while new_total > limit and len(entries) > 0:
+                    oldest = entries.pop(0)
+                    # Try to store in warm tier
+                    if _warm_set(target, f"auto_{int(time.time())}_{overflow_count}", oldest):
+                        overflow_count += 1
+                    else:
+                        # Vault not available — put it back and reject
+                        entries.insert(0, oldest)
+                        return {
+                            "success": False,
+                            "error": (
+                                f"Memory at capacity and warm tier unavailable. "
+                                f"Remove entries or configure Sovereign Vault."
+                            ),
+                            "current_entries": entries,
+                            "usage": f"{self._char_count(target):,}/{limit:,}",
+                        }
+                    new_entries = entries + [content]
+                    new_total = len(ENTRY_DELIMITER.join(new_entries))
+
+                entries.append(content)
+                self._set_entries(target, entries)
+                self.save_to_disk(target)
+
+                response = self._success_response(
+                    target,
+                    f"Entry added. {overflow_count} old entr{'y' if overflow_count == 1 else 'ies'} overflowed to warm tier."
+                )
+                response["warm_overflow"] = overflow_count
+                return response
 
             entries.append(content)
             self._set_entries(target, entries)
@@ -353,7 +411,6 @@ class MemoryStore:
         if not new_content:
             return {"success": False, "error": "new_content cannot be empty. Use 'remove' to delete entries."}
 
-        # Scan replacement content for injection/exfiltration
         scan_error = _scan_memory_content(new_content)
         if scan_error:
             return {"success": False, "error": scan_error}
@@ -370,7 +427,6 @@ class MemoryStore:
                 return {"success": False, "error": f"No entry matched '{old_text}'."}
 
             if len(matches) > 1:
-                # If all matches are identical (exact duplicates), operate on the first one
                 unique_texts = {e for _, e in matches}
                 if len(unique_texts) > 1:
                     previews = [e[:80] + ("..." if len(e) > 80 else "") for _, e in matches]
@@ -379,12 +435,10 @@ class MemoryStore:
                         "error": f"Multiple entries matched '{old_text}'. Be more specific.",
                         "matches": previews,
                     }
-                # All identical -- safe to replace just the first
 
             idx = matches[0][0]
             limit = self._char_limit(target)
 
-            # Check that replacement doesn't blow the budget
             test_entries = entries.copy()
             test_entries[idx] = new_content
             new_total = len(ENTRY_DELIMITER.join(test_entries))
@@ -422,7 +476,6 @@ class MemoryStore:
                 return {"success": False, "error": f"No entry matched '{old_text}'."}
 
             if len(matches) > 1:
-                # If all matches are identical (exact duplicates), remove the first one
                 unique_texts = {e for _, e in matches}
                 if len(unique_texts) > 1:
                     previews = [e[:80] + ("..." if len(e) > 80 else "") for _, e in matches]
@@ -431,7 +484,6 @@ class MemoryStore:
                         "error": f"Multiple entries matched '{old_text}'. Be more specific.",
                         "matches": previews,
                     }
-                # All identical -- safe to remove just the first
 
             idx = matches[0][0]
             entries.pop(idx)
@@ -440,15 +492,59 @@ class MemoryStore:
 
         return self._success_response(target, "Entry removed.")
 
+    def read_warm(self, target: str, query: str = "") -> Dict[str, Any]:
+        """Read entries from the warm tier (Sovereign Vault)."""
+        entries = _warm_entries_list(target)
+        if query:
+            query_lower = query.lower()
+            entries = [e for e in entries if query_lower in e["value"].lower()]
+        return {
+            "success": True,
+            "target": target,
+            "tier": "warm",
+            "entries": entries,
+            "entry_count": len(entries),
+            "vault_available": _VAULT_IMPORTED,
+        }
+
+    def warm_to_hot(self, target: str, key: str) -> Dict[str, Any]:
+        """Recall a warm-tier entry back into hot tier. Key is the warm entry's key suffix."""
+        content = _warm_get(target, key)
+        if content is None:
+            return {"success": False, "error": f"No warm entry found with key '{key}'."}
+
+        # Remove from warm tier
+        _warm_remove(target, key)
+
+        # Add to hot tier
+        with self._file_lock(self._path_for(target)):
+            bak = self._reload_target(target)
+            if bak:
+                return _drift_error(self._path_for(target), bak)
+
+            entries = self._entries_for(target)
+            limit = self._char_limit(target)
+
+            # Overflow if needed
+            new_entries = entries + [content]
+            new_total = len(ENTRY_DELIMITER.join(new_entries))
+            overflow_count = 0
+            while new_total > limit and len(entries) > 0:
+                oldest = entries.pop(0)
+                _warm_set(target, f"auto_{int(time.time())}_{overflow_count}", oldest)
+                overflow_count += 1
+                new_entries = entries + [content]
+                new_total = len(ENTRY_DELIMITER.join(new_entries))
+
+            entries.append(content)
+            self._set_entries(target, entries)
+            self.save_to_disk(target)
+
+        return self._success_response(target, f"Entry recalled from warm tier. {overflow_count} overflowed to warm." if overflow_count else "Entry recalled from warm tier.")
+
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """
         Return the frozen snapshot for system prompt injection.
-
-        This returns the state captured at load_from_disk() time, NOT the live
-        state. Mid-session writes do not affect this. This keeps the system
-        prompt stable across all turns, preserving the prefix cache.
-
-        Returns None if the snapshot is empty (no entries at load time).
         """
         block = self._system_prompt_snapshot.get(target, "")
         return block if block else None
@@ -460,6 +556,7 @@ class MemoryStore:
         current = self._char_count(target)
         limit = self._char_limit(target)
         pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
+        warm = _warm_count(target)
 
         resp = {
             "success": True,
@@ -467,36 +564,48 @@ class MemoryStore:
             "entries": entries,
             "usage": f"{pct}% — {current:,}/{limit:,} chars",
             "entry_count": len(entries),
+            "warm_entries": warm,
         }
         if message:
             resp["message"] = message
         return resp
 
     def _render_block(self, target: str, entries: List[str]) -> str:
-        """Render a system prompt block with header and usage indicator."""
+        """Render a system prompt block with header showing both hot and warm tier usage."""
         if not entries:
-            return ""
+            # Still show header if warm tier has data
+            warm = _warm_count(target)
+            if warm == 0:
+                return ""
+
+            limit = self._char_limit(target)
+            if target == "user":
+                header = f"USER PROFILE (who the user is) [0% — 0/{limit:,} chars] [+{warm} warm entries]"
+            else:
+                header = f"MEMORY (your personal notes) [0% — 0/{limit:,} chars] [+{warm} warm entries]"
+            separator = "═" * 46
+            return f"{separator}\n{header}\n{separator}\n"
 
         limit = self._char_limit(target)
         content = ENTRY_DELIMITER.join(entries)
         current = len(content)
         pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
+        warm = _warm_count(target)
 
         if target == "user":
             header = f"USER PROFILE (who the user is) [{pct}% — {current:,}/{limit:,} chars]"
         else:
             header = f"MEMORY (your personal notes) [{pct}% — {current:,}/{limit:,} chars]"
 
+        if warm > 0:
+            header += f" [+{warm} warm — use memory(action='read_warm') to browse]"
+
         separator = "═" * 46
         return f"{separator}\n{header}\n{separator}\n{content}"
 
     @staticmethod
     def _read_file(path: Path) -> List[str]:
-        """Read a memory file and split into entries.
-
-        No file locking needed: _write_file uses atomic rename, so readers
-        always see either the previous complete file or the new complete file.
-        """
+        """Read a memory file and split into entries."""
         if not path.exists():
             return []
         try:
@@ -507,35 +616,11 @@ class MemoryStore:
         if not raw.strip():
             return []
 
-        # Use ENTRY_DELIMITER for consistency with _write_file. Splitting by "§"
-        # alone would incorrectly split entries that contain "§" in their content.
         entries = [e.strip() for e in raw.split(ENTRY_DELIMITER)]
         return [e for e in entries if e]
 
     def _detect_external_drift(self, target: str) -> Optional[str]:
-        """Return a backup-path string if on-disk content shows external drift.
-
-        The memory file is supposed to be a list of small entries the tool
-        wrote, joined by §. Detect drift via two signals:
-
-        1. Round-trip mismatch — re-parsing and re-serializing the file
-           doesn't produce identical bytes (rare; would catch oddly-encoded
-           delimiters).
-        2. Entry-size overflow — any single parsed entry exceeds the
-           store's whole-file char limit. The tool budgets the ENTIRE store
-           against that limit; no single tool-written entry can exceed it.
-           When we see one entry larger than the limit, an external writer
-           (patch tool, shell append, manual edit, sister session) appended
-           free-form content into what the tool will treat as one entry.
-           Flushing would then truncate that entry to the model's new
-           content, discarding the appended bytes — issue #26045.
-
-        Returns the absolute path of the .bak file when drift was found and
-        backed up; returns None when the file looks tool-shaped.
-
-        Note: this is an INSTANCE method (not static) because we need the
-        per-target char_limit for signal #2.
-        """
+        """Return a backup-path string if on-disk content shows external drift."""
         path = self._path_for(target)
         if not path.exists():
             return None
@@ -556,9 +641,6 @@ class MemoryStore:
         if not drift_detected:
             return None
 
-        # Drift confirmed — snapshot the file so the operator can recover
-        # whatever the external writer added, then return the .bak path so
-        # the caller can refuse the mutation.
         ts = int(time.time())
         bak_path = path.with_suffix(path.suffix + f".bak.{ts}")
         try:
@@ -569,16 +651,9 @@ class MemoryStore:
 
     @staticmethod
     def _write_file(path: Path, entries: List[str]):
-        """Write entries to a memory file using atomic temp-file + rename.
-
-        Previous implementation used open("w") + flock, but "w" truncates the
-        file *before* the lock is acquired, creating a race window where
-        concurrent readers see an empty file. Atomic rename avoids this:
-        readers always see either the old complete file or the new one.
-        """
+        """Write entries to a memory file using atomic temp-file + rename."""
         content = ENTRY_DELIMITER.join(entries) if entries else ""
         try:
-            # Write to temp file in same directory (same filesystem for atomic rename)
             fd, tmp_path = tempfile.mkstemp(
                 dir=str(path.parent), suffix=".tmp", prefix=".mem_"
             )
@@ -589,7 +664,6 @@ class MemoryStore:
                     os.fsync(f.fileno())
                 atomic_replace(tmp_path, path)
             except BaseException:
-                # Clean up temp file on any failure
                 try:
                     os.unlink(tmp_path)
                 except OSError:
@@ -608,6 +682,8 @@ def memory_tool(
 ) -> str:
     """
     Single entry point for the memory tool. Dispatches to MemoryStore methods.
+
+    Supports actions: add, replace, remove, read_warm, warm_to_hot.
 
     Returns JSON string with results.
     """
@@ -634,8 +710,34 @@ def memory_tool(
             return tool_error("old_text is required for 'remove' action.", success=False)
         result = store.remove(target, old_text)
 
+    elif action == "read":
+        # Read current hot tier entries
+        entries = store._entries_for(target)
+        usage = store._char_count(target)
+        limit = store._char_limit(target)
+        warm = _warm_count(target)
+        pct = min(100, int((usage / limit) * 100)) if limit > 0 else 0
+        result = {
+            "success": True,
+            "target": target,
+            "entries": entries,
+            "usage": f"{pct}% — {usage:,}/{limit:,} chars",
+            "entry_count": len(entries),
+            "warm_entries": warm,
+            "warm_available": _VAULT_IMPORTED,
+        }
+
+    elif action == "read_warm":
+        query = content or ""
+        result = store.read_warm(target, query)
+
+    elif action == "warm_to_hot":
+        if not old_text:
+            return tool_error("old_text (warm entry key) is required for 'warm_to_hot' action.", success=False)
+        result = store.warm_to_hot(target, old_text)
+
     else:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove, read, read_warm, warm_to_hot", success=False)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -667,19 +769,27 @@ MEMORY_SCHEMA = {
         "state to memory; use session_search to recall those from past transcripts.\n"
         "If you've discovered a new way to do something, solved a problem that could be "
         "necessary later, save it as a skill with the skill tool.\n\n"
-        "TWO TARGETS:\n"
-        "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
-        "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
-        "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
-        "remove (delete -- old_text identifies it).\n\n"
-        "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
+        "TWO TIERS:\n"
+        "- HOT (default): in-context, always available, char-limited\n"
+        "- WARM: Sovereign Vault, unlimited, browse with action='read_warm'\n\n"
+        "ACTIONS:\n"
+        "- add: new entry (auto-overflows to warm on full)\n"
+        "- replace: update existing (old_text identifies it)\n"
+        "- remove: delete (old_text identifies it)\n"
+        "- read: view hot tier\n"
+        "- read_warm: browse warm tier (optional content=query filters results)\n"
+        "- warm_to_hot: recall from warm to hot (old_text=key)\n\n"
+        "TARGETS:\n"
+        "- 'user': who the user is\n"
+        "- 'memory': your notes\n\n"
+        "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, temporary task state."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
+                "enum": ["add", "replace", "remove", "read", "read_warm", "warm_to_hot"],
                 "description": "The action to perform."
             },
             "target": {
@@ -689,11 +799,13 @@ MEMORY_SCHEMA = {
             },
             "content": {
                 "type": "string",
-                "description": "The entry content. Required for 'add' and 'replace'."
+                "description": "Entry content (required for 'add', 'replace'). "
+                               "For 'read_warm': optional query string to filter results."
             },
             "old_text": {
                 "type": "string",
-                "description": "Short unique substring identifying the entry to replace or remove."
+                "description": "Short unique substring identifying the hot entry to replace or remove. "
+                               "For 'warm_to_hot': the warm entry key."
             },
         },
         "required": ["action", "target"],
@@ -717,7 +829,3 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-
-
-
